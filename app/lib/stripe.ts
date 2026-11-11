@@ -64,10 +64,11 @@ export const createStripeCheckoutSession = async (
   }
   const params: Record<string, string> = {
     mode: "payment",
-    // Cards only (Apple Pay / Google Pay ride on this). Without it Stripe can
-    // offer delayed methods such as direct debit, which complete "unpaid" and
-    // would leave the order waiting with nothing here to confirm it later.
-    "payment_method_types[0]": "card",
+    // Payment methods are managed in the Stripe Dashboard (Settings → Payment
+    // methods): the API's payment_method_types is rejected on current API
+    // versions. The dashboard must offer Card only (wallets ride on it) —
+    // delayed methods such as direct debit complete "unpaid" and would leave
+    // the order waiting with nothing here to confirm it later.
     "line_items[0][quantity]": "1",
     "line_items[0][price_data][currency]": input.currency.toLowerCase(),
     "line_items[0][price_data][unit_amount]": String(input.amountMinor),
