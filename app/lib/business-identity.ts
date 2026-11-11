@@ -17,6 +17,12 @@ export const BUSINESS = {
   legalName: env(process.env.NEXT_PUBLIC_BUSINESS_LEGAL_NAME),
   abn: env(process.env.NEXT_PUBLIC_BUSINESS_ABN),
   email: env(process.env.NEXT_PUBLIC_SUPPORT_EMAIL),
+  /**
+   * The name card payments show on a bank statement, copied exactly from
+   * Stripe (Settings → Public details → Statement descriptor). The card pay
+   * page names it so buyers recognise the charge; it's left out while unset.
+   */
+  cardStatementDescriptor: env(process.env.NEXT_PUBLIC_CARD_STATEMENT_DESCRIPTOR),
   // No street address on any surface: only the dispatch city is published.
   dispatchFrom: {
     city: "Melbourne",
