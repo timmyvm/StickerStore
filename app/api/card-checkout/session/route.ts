@@ -42,9 +42,12 @@ export async function GET(request: Request) {
   if (!orderNumber) {
     return NextResponse.json({ error: "Enter a valid order number." }, { status: 400 });
   }
+  // Signed link factor — forwarded, never verified here (the peptide store owns
+  // the secret; it returns state "invalid_link" without it where it matters).
+  const cardToken = new URL(request.url).searchParams.get("t")?.trim() ?? "";
 
   try {
-    const summary = toCardOrderSummary(await fetchPeptideCardOrder(orderNumber));
+    const summary = toCardOrderSummary(await fetchPeptideCardOrder(orderNumber, cardToken));
     if (!summary) {
       console.error("[card-checkout] payable order has no usable total/currency", orderNumber);
       return NextResponse.json({ error: ORDER_UNAVAILABLE }, { status: 500 });
@@ -65,20 +68,23 @@ export async function POST(request: Request) {
     );
   }
 
-  let body: { orderNumber?: unknown };
+  let body: { orderNumber?: unknown; t?: unknown };
   try {
-    body = (await request.json()) as { orderNumber?: unknown };
+    body = (await request.json()) as { orderNumber?: unknown; t?: unknown };
   } catch {
     return NextResponse.json({ error: "Invalid request." }, { status: 400 });
   }
   const orderNumber =
     typeof body.orderNumber === "string" ? normalizePeptideOrderNumber(body.orderNumber) : null;
+  // Signed link factor from the pay page URL — kept in the Stripe return URLs
+  // so the buyer can retry after Back/cancel without a fresh link.
+  const cardToken = typeof body.t === "string" ? body.t.trim() : "";
   if (!orderNumber) {
     return NextResponse.json({ error: "Enter a valid order number." }, { status: 400 });
   }
 
   try {
-    const order = await fetchPeptideCardOrder(orderNumber);
+    const order = await fetchPeptideCardOrder(orderNumber, cardToken);
     const summary = toCardOrderSummary(order);
     if (!summary) {
       console.error("[card-checkout] payable order has no usable total/currency", orderNumber);
@@ -90,7 +96,9 @@ export async function POST(request: Request) {
 
     // Charge exactly the total the pay page showed: the same narrowed summary.
     const origin = resolveOrigin(request);
-    const payPage = `${origin}${CARD_CHECKOUT_PATH}?order=${encodeURIComponent(orderNumber)}`;
+    const payPage = `${origin}${CARD_CHECKOUT_PATH}?order=${encodeURIComponent(orderNumber)}${
+      cardToken ? `&t=${encodeURIComponent(cardToken)}` : ""
+    }`;
     const session = await createStripeCheckoutSession({
       amountMinor: Math.round(summary.total * 100),
       currency: summary.currency,

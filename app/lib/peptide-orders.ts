@@ -15,7 +15,7 @@ import { parseOrderCurrency, type CardOrderSummary } from "@/app/lib/card-checko
 
 export type PeptideCardOrder = {
   ok: true;
-  state: "payable" | "already_paid" | "cancelled" | "not_card" | "not_found";
+  state: "payable" | "already_paid" | "cancelled" | "not_card" | "not_found" | "invalid_link";
   orderNumber: string;
   orderStatusUrl?: string;
   items?: Array<{ name: string; variant: string; quantity: number; lineTotal: number }>;
@@ -77,13 +77,19 @@ export const normalizePeptideOrderNumber = (value: string): string | null => {
   return /^A\d{6}$/.test(compact) ? `A-${compact.slice(1)}` : null;
 };
 
-/** Order summary for the pay page. Never throws on missing orders — states travel in-band. */
+/**
+ * Order summary for the pay page. The cardToken is the signed link factor the
+ * peptide store verifies before it releases the summary (order numbers alone
+ * are guessable). Never throws on missing orders — states travel in-band.
+ */
 export const fetchPeptideCardOrder = async (
-  orderNumber: string
+  orderNumber: string,
+  cardToken?: string | null
 ): Promise<PeptideCardOrder> => {
-  const payload = await peptideRequest(
-    `/api/orders/card-checkout?order=${encodeURIComponent(orderNumber)}`
-  );
+  const params = new URLSearchParams({ order: orderNumber });
+  const token = cardToken?.trim();
+  if (token) params.set("t", token);
+  const payload = await peptideRequest(`/api/orders/card-checkout?${params.toString()}`);
   return payload as unknown as PeptideCardOrder;
 };
 

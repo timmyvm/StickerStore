@@ -46,7 +46,13 @@ const NETWORK_ERROR = "We couldn't reach the payment service. Check your connect
 const LOAD_ERROR = "We couldn't load this order. Please try again.";
 const PAY_ERROR = "We couldn't open the secure payment page. Please try again.";
 
-const CLOSED_STATES: readonly string[] = ["already_paid", "cancelled", "not_card", "not_found"];
+const CLOSED_STATES: readonly string[] = [
+  "already_paid",
+  "cancelled",
+  "not_card",
+  "not_found",
+  "invalid_link",
+];
 const isClosedState = (value: unknown): value is ClosedCardOrderState =>
   typeof value === "string" && CLOSED_STATES.includes(value);
 
@@ -70,6 +76,9 @@ export const CardCheckoutClient = () => {
   const searchParams = useSearchParams();
   const sessionId = searchParams.get("session_id");
   const orderNumber = readOrderNumber(searchParams);
+  // Signed link factor from the peptide store (order numbers alone are
+  // guessable). Forwarded to the summary/pay APIs, never verified here.
+  const linkToken = searchParams.get("t");
   const [phase, setPhase] = useState<Phase>(() => initialPhase(sessionId, orderNumber));
   const [attempt, setAttempt] = useState(0);
   const pendingRef = useRef(false);
@@ -115,10 +124,11 @@ export const CardCheckoutClient = () => {
     let isActive = true;
     (async () => {
       try {
-        const response = await fetch(
-          `/api/card-checkout/session?order=${encodeURIComponent(orderNumber)}`,
-          { cache: "no-store" }
-        );
+        const query = new URLSearchParams({ order: orderNumber });
+        if (linkToken) query.set("t", linkToken);
+        const response = await fetch(`/api/card-checkout/session?${query.toString()}`, {
+          cache: "no-store",
+        });
         const payload = (await response.json().catch(() => ({}))) as {
           state?: string;
           error?: string;
@@ -150,7 +160,7 @@ export const CardCheckoutClient = () => {
     return () => {
       isActive = false;
     };
-  }, [orderNumber, sessionId, attempt]);
+  }, [orderNumber, sessionId, attempt, linkToken]);
 
   /**
    * Browser Back from Stripe can restore this page from the back-forward
@@ -189,7 +199,7 @@ export const CardCheckoutClient = () => {
       const response = await fetch("/api/card-checkout/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orderNumber }),
+        body: JSON.stringify({ orderNumber, t: linkToken }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         state?: string;
@@ -210,7 +220,7 @@ export const CardCheckoutClient = () => {
     } catch {
       fail(NETWORK_ERROR);
     }
-  }, [orderNumber]);
+  }, [orderNumber, linkToken]);
 
   const descriptor = BUSINESS.cardStatementDescriptor;
   const freshLinkHint = "Open your order page and choose Pay by card to get a fresh payment link.";
@@ -368,6 +378,17 @@ export const CardCheckoutClient = () => {
             title="This order was cancelled"
           >
             <p>It can&apos;t be paid any more. If you still want these items, please place a new order.</p>
+          </PayMessage>
+        );
+      }
+      if (phase.state === "invalid_link") {
+        return (
+          <PayMessage
+            tone="neutral"
+            icon={<AlertIcon className="h-7 w-7" />}
+            title="This payment link isn&apos;t valid"
+          >
+            <p>{freshLinkHint}</p>
           </PayMessage>
         );
       }

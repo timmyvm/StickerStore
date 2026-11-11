@@ -30,7 +30,12 @@ export type PayableCardOrder = {
   currency: string;
 };
 
-export type ClosedCardOrderState = "already_paid" | "cancelled" | "not_card" | "not_found";
+export type ClosedCardOrderState =
+  | "already_paid"
+  | "cancelled"
+  | "not_card"
+  | "not_found"
+  | "invalid_link";
 
 /**
  * What the pay page receives. Deliberately narrow: anyone can type an order
