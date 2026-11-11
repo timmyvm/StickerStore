@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 import { getClientIp, rateLimit } from "@/app/lib/rate-limit";
+import { CARD_CHECKOUT_PATH } from "@/app/lib/card-checkout";
 import {
   fetchPeptideCardOrder,
   normalizePeptideOrderNumber,
+  toCardOrderSummary,
 } from "@/app/lib/peptide-orders";
 import { createStripeCheckoutSession } from "@/app/lib/stripe";
 
@@ -12,7 +14,13 @@ export const dynamic = "force-dynamic";
  * Card checkout for peptide-store orders: the /A=order page posts an order
  * number here, we fetch the payable summary from the peptide store (the price
  * never travels through the browser) and hand back a Stripe Checkout URL.
+ *
+ * Order numbers are guessable, so neither handler returns the buyer's email
+ * or the signed order-status link (toCardOrderSummary strips both). The
+ * status link is only returned by /verify, after Stripe confirms payment.
  */
+
+const ORDER_UNAVAILABLE = "We couldn't load this order. Please try again.";
 
 const resolveOrigin = (request: Request) =>
   process.env.NEXT_PUBLIC_SITE_URL?.trim().replace(/\/+$/, "") ||
@@ -36,14 +44,15 @@ export async function GET(request: Request) {
   }
 
   try {
-    const order = await fetchPeptideCardOrder(orderNumber);
-    return NextResponse.json(order);
+    const summary = toCardOrderSummary(await fetchPeptideCardOrder(orderNumber));
+    if (!summary) {
+      console.error("[card-checkout] payable order has no usable total/currency", orderNumber);
+      return NextResponse.json({ error: ORDER_UNAVAILABLE }, { status: 500 });
+    }
+    return NextResponse.json(summary, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     console.error("[card-checkout] summary failed", error);
-    return NextResponse.json(
-      { error: "We couldn't load this order. Please try again." },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: ORDER_UNAVAILABLE }, { status: 500 });
   }
 }
 
@@ -70,21 +79,25 @@ export async function POST(request: Request) {
 
   try {
     const order = await fetchPeptideCardOrder(orderNumber);
-    if (order.state !== "payable") {
-      return NextResponse.json({ state: order.state, orderStatusUrl: order.orderStatusUrl });
-    }
-    if (typeof order.total !== "number" || !order.currency) {
+    const summary = toCardOrderSummary(order);
+    if (!summary) {
+      console.error("[card-checkout] payable order has no usable total/currency", orderNumber);
       return NextResponse.json({ error: "Order total is unavailable." }, { status: 500 });
     }
+    if (summary.state !== "payable") {
+      return NextResponse.json({ state: summary.state });
+    }
 
+    // Charge exactly the total the pay page showed: the same narrowed summary.
     const origin = resolveOrigin(request);
+    const payPage = `${origin}${CARD_CHECKOUT_PATH}?order=${encodeURIComponent(orderNumber)}`;
     const session = await createStripeCheckoutSession({
-      amountMinor: Math.round(order.total * 100),
-      currency: order.currency,
+      amountMinor: Math.round(summary.total * 100),
+      currency: summary.currency,
       orderNumber,
       customerEmail: order.customerEmail ?? null,
-      successUrl: `${origin}/A=order?order=${encodeURIComponent(orderNumber)}&session_id={CHECKOUT_SESSION_ID}`,
-      cancelUrl: `${origin}/A=order?order=${encodeURIComponent(orderNumber)}`,
+      successUrl: `${payPage}&session_id={CHECKOUT_SESSION_ID}`,
+      cancelUrl: payPage,
     });
 
     return NextResponse.json({ state: "payable", checkoutUrl: session.url });

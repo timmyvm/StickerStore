@@ -2,64 +2,79 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { Container } from "@/app/components/ui/Container";
-import { Button } from "@/app/components/ui/Button";
-
-type SummaryResponse = {
-  ok?: boolean;
-  state?: "payable" | "already_paid" | "cancelled" | "not_card" | "not_found";
-  orderNumber?: string;
-  items?: Array<{ name: string; variant: string; quantity: number; lineTotal: number }>;
-  subtotal?: number;
-  discountAmount?: number;
-  discountCode?: string | null;
-  voucherCodes?: Array<{ code: string; value: number }>;
-  voucherTotal?: number;
-  shippingCost?: number;
-  signatureFee?: number;
-  total?: number;
-  currency?: string;
-  orderStatusUrl?: string | null;
-  error?: string;
-};
+import { BUSINESS } from "@/app/lib/business-identity";
+import {
+  CARD_CHECKOUT_PATH,
+  toSafeHttpUrl,
+  type ClosedCardOrderState,
+  type PayableCardOrder,
+} from "@/app/lib/card-checkout";
+import { Button, getButtonClasses } from "@/app/components/ui/Button";
+import {
+  AlertIcon,
+  ArrowRightIcon,
+  CardIcon,
+  CheckIcon,
+  CircleSlashIcon,
+  SpinnerIcon,
+} from "@/app/components/card-checkout/PayIcons";
+import {
+  OrderChip,
+  PayGrid,
+  PayIntro,
+  PayLoading,
+  PayMessage,
+  PayShell,
+} from "@/app/components/card-checkout/PayParts";
+import { PayOrderSummary } from "@/app/components/card-checkout/PayOrderSummary";
+import { PayPanel } from "@/app/components/card-checkout/PayPanel";
 
 type Phase =
   | { kind: "loading" }
-  | { kind: "error"; message: string }
-  | { kind: "summary"; order: SummaryResponse }
-  | { kind: "paying" }
-  | { kind: "paid"; orderStatusUrl: string | null; orderNumber: string | null };
+  | { kind: "missing" }
+  | { kind: "load-error"; message: string }
+  | { kind: "payable"; order: PayableCardOrder; redirecting: boolean; payError: string | null }
+  | { kind: "closed"; state: ClosedCardOrderState }
+  /** Back from Stripe with a session id: asking Stripe whether it paid. */
+  | { kind: "verifying" }
+  /** Stripe says the session didn't complete a payment. */
+  | { kind: "unpaid" }
+  | { kind: "verify-error" }
+  | { kind: "paid"; orderNumber: string | null; orderStatusUrl: string | null };
 
-/** Formats in the peptide order's currency (AUD/USD/EUR — not just AUD like this store's own checkout). */
-const formatAmount = (amount: number, currency: string) =>
-  new Intl.NumberFormat("en-AU", {
-    style: "currency",
-    currency: ["AUD", "USD", "EUR"].includes(currency) ? currency : "AUD",
-    currencyDisplay: "narrowSymbol",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(amount);
+const NETWORK_ERROR = "We couldn't reach the payment service. Check your connection and try again.";
+const LOAD_ERROR = "We couldn't load this order. Please try again.";
+const PAY_ERROR = "We couldn't open the secure payment page. Please try again.";
+
+const CLOSED_STATES: readonly string[] = ["already_paid", "cancelled", "not_card", "not_found"];
+const isClosedState = (value: unknown): value is ClosedCardOrderState =>
+  typeof value === "string" && CLOSED_STATES.includes(value);
 
 /**
- * The peptide store links here as /A=order?A-123456 — a bare query value —
- * but ?order=A-123456 is accepted too.
+ * The peptide store links here as /A=order?A-123456 (a bare query key), and
+ * Stripe returns to ?order=A-123456. Both are accepted.
  */
 const readOrderNumber = (params: URLSearchParams): string | null => {
   const explicit = params.get("order") ?? params.get("A") ?? null;
-  if (explicit) return explicit;
+  if (explicit) return explicit.trim().toUpperCase();
   for (const key of params.keys()) {
-    if (/^A-?\d{6}$/i.test(key)) return key;
+    if (/^A-?\d{6}$/i.test(key)) return key.toUpperCase();
   }
   return null;
 };
 
+const initialPhase = (sessionId: string | null, orderNumber: string | null): Phase =>
+  sessionId ? { kind: "verifying" } : orderNumber ? { kind: "loading" } : { kind: "missing" };
+
 export const CardCheckoutClient = () => {
   const searchParams = useSearchParams();
   const sessionId = searchParams.get("session_id");
-  const [phase, setPhase] = useState<Phase>({ kind: "loading" });
+  const orderNumber = readOrderNumber(searchParams);
+  const [phase, setPhase] = useState<Phase>(() => initialPhase(sessionId, orderNumber));
+  const [attempt, setAttempt] = useState(0);
   const pendingRef = useRef(false);
 
-  /** Success return from Stripe: verify with Stripe, then confirm the order. */
+  /** Back from Stripe: ask the server, which asks Stripe (never the browser). */
   useEffect(() => {
     if (!sessionId) return;
     let isActive = true;
@@ -74,63 +89,102 @@ export const CardCheckoutClient = () => {
           state?: string;
           orderStatusUrl?: string | null;
           orderNumber?: string;
-          error?: string;
         };
         if (!isActive) return;
         if (response.ok && payload.state === "paid") {
           setPhase({
             kind: "paid",
-            orderStatusUrl: payload.orderStatusUrl ?? null,
-            orderNumber: payload.orderNumber ?? null,
+            orderNumber: payload.orderNumber ?? orderNumber,
+            orderStatusUrl: toSafeHttpUrl(payload.orderStatusUrl),
           });
           return;
         }
-        // Not paid yet (e.g. the buyer backed out of the Stripe page) — show
-        // the pay view again so they can retry.
-        setPhase({ kind: "error", message: payload.error ?? "Payment isn't complete yet — you can try again below." });
+        setPhase(response.ok && payload.state === "unpaid" ? { kind: "unpaid" } : { kind: "verify-error" });
       } catch {
-        if (isActive) {
-          setPhase({ kind: "error", message: "We couldn't verify your payment. Please try again." });
-        }
+        if (isActive) setPhase({ kind: "verify-error" });
       }
     })();
     return () => {
       isActive = false;
     };
-  }, [sessionId]);
+  }, [sessionId, orderNumber, attempt]);
 
-  /** Load the order summary for display. */
-  const orderNumber = readOrderNumber(searchParams);
+  /** The order summary (no side effects, no Stripe call). */
   useEffect(() => {
     if (sessionId || !orderNumber) return;
     let isActive = true;
     (async () => {
       try {
         const response = await fetch(
-          `/api/card-checkout/session?order=${encodeURIComponent(orderNumber)}`
+          `/api/card-checkout/session?order=${encodeURIComponent(orderNumber)}`,
+          { cache: "no-store" }
         );
-        const payload = (await response.json().catch(() => ({}))) as SummaryResponse;
+        const payload = (await response.json().catch(() => ({}))) as {
+          state?: string;
+          error?: string;
+        };
         if (!isActive) return;
-        if (response.ok && payload.state) {
-          setPhase({ kind: "summary", order: payload });
+        if (response.ok && payload.state === "payable") {
+          setPhase({
+            kind: "payable",
+            order: payload as PayableCardOrder,
+            redirecting: false,
+            payError: null,
+          });
           return;
         }
-        setPhase({ kind: "error", message: payload.error ?? "We couldn't load this order." });
-      } catch {
-        if (isActive) {
-          setPhase({ kind: "error", message: "We couldn't reach the payment service. Check your connection and try again." });
+        if (response.ok && isClosedState(payload.state)) {
+          setPhase({ kind: "closed", state: payload.state });
+          return;
         }
+        // 400: the number in the link isn't an order number at all.
+        setPhase(
+          response.status === 400
+            ? { kind: "closed", state: "not_found" }
+            : { kind: "load-error", message: payload.error ?? LOAD_ERROR }
+        );
+      } catch {
+        if (isActive) setPhase({ kind: "load-error", message: NETWORK_ERROR });
       }
     })();
     return () => {
       isActive = false;
     };
-  }, [orderNumber, sessionId]);
+  }, [orderNumber, sessionId, attempt]);
+
+  /**
+   * Browser Back from Stripe can restore this page from the back-forward
+   * cache, frozen mid-redirect. Unlock the button when that happens.
+   */
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      pendingRef.current = false;
+      setPhase((current) =>
+        current.kind === "payable" ? { ...current, redirecting: false } : current
+      );
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, []);
+
+  const retry = useCallback(() => {
+    setPhase(initialPhase(sessionId, orderNumber));
+    setAttempt((count) => count + 1);
+  }, [sessionId, orderNumber]);
 
   const handlePay = useCallback(async () => {
     if (pendingRef.current || !orderNumber) return;
     pendingRef.current = true;
-    setPhase({ kind: "paying" });
+    setPhase((current) =>
+      current.kind === "payable" ? { ...current, redirecting: true, payError: null } : current
+    );
+    const fail = (message: string) => {
+      pendingRef.current = false;
+      setPhase((current) =>
+        current.kind === "payable" ? { ...current, redirecting: false, payError: message } : current
+      );
+    };
     try {
       const response = await fetch("/api/card-checkout/session", {
         method: "POST",
@@ -140,208 +194,202 @@ export const CardCheckoutClient = () => {
       const payload = (await response.json().catch(() => ({}))) as {
         state?: string;
         checkoutUrl?: string;
-        orderStatusUrl?: string;
         error?: string;
       };
-      if (response.ok && payload.state === "payable" && payload.checkoutUrl) {
-        window.location.assign(payload.checkoutUrl);
-        return; // Keep the button locked while Stripe loads.
+      const checkoutUrl = toSafeHttpUrl(payload.checkoutUrl);
+      if (response.ok && payload.state === "payable" && checkoutUrl) {
+        window.location.assign(checkoutUrl);
+        return; // Stay locked while Stripe loads.
       }
-      if (response.ok && payload.state === "already_paid" && payload.orderStatusUrl) {
-        window.location.assign(payload.orderStatusUrl);
+      if (response.ok && isClosedState(payload.state)) {
+        pendingRef.current = false;
+        setPhase({ kind: "closed", state: payload.state });
         return;
       }
-      setPhase({
-        kind: "error",
-        message: payload.error ?? "We couldn't start card payment. Please try again.",
-      });
+      fail(payload.error ?? PAY_ERROR);
     } catch {
-      setPhase({ kind: "error", message: "We couldn't reach the payment service. Check your connection and try again." });
+      fail(NETWORK_ERROR);
     }
-    pendingRef.current = false;
   }, [orderNumber]);
 
-  return renderView({ phase, orderNumber, onPay: handlePay });
-};
+  const descriptor = BUSINESS.cardStatementDescriptor;
+  const freshLinkHint = "Open your order page and choose Pay by card to get a fresh payment link.";
 
-type ViewProps = {
-  phase: Phase;
-  orderNumber: string | null;
-  onPay: () => void;
-};
+  switch (phase.kind) {
+    case "loading":
+      return <PayLoading orderNumber={orderNumber} />;
 
-const renderView = ({ phase, orderNumber, onPay }: ViewProps) => {
-  const displayOrderNumber = orderNumber?.toUpperCase() ?? null;
-  const currency = phase.kind === "summary" ? (phase.order.currency ?? "AUD") : "AUD";
+    case "payable":
+      return (
+        <PayShell>
+          <PayIntro orderNumber={phase.order.orderNumber} />
+          <PayGrid>
+            <PayOrderSummary order={phase.order} />
+            <PayPanel
+              order={phase.order}
+              redirecting={phase.redirecting}
+              payError={phase.payError}
+              onPay={handlePay}
+            />
+          </PayGrid>
+        </PayShell>
+      );
 
-  return (
-    <section className="py-10 sm:py-14">
-      <Container className="max-w-2xl">
-        <div className="space-y-6 rounded-2xl border border-[color:var(--color-border)] bg-[color:var(--color-surface-elevated)] p-6 shadow-soft">
-          <div className="space-y-2">
-            <h1 className="font-display text-2xl font-semibold text-[color:var(--color-ink)] sm:text-3xl">
-              {phase.kind === "paid" ? "Payment received" : "Pay your order by card"}
-            </h1>
-            {displayOrderNumber ? (
-              <p className="text-sm text-[color:var(--color-ink-muted)]">
-                Order{" "}
-                <span className="font-mono font-semibold text-[color:var(--color-ink)]">
-                  {displayOrderNumber}
-                </span>
-              </p>
-            ) : null}
-          </div>
+    case "verifying":
+      return (
+        <PayMessage
+          steps={1}
+          tone="info"
+          icon={<SpinnerIcon className="h-7 w-7" />}
+          title="Confirming your payment"
+        >
+          <p role="status">
+            We&apos;re checking with Stripe that your payment went through. This only takes a
+            moment.
+          </p>
+        </PayMessage>
+      );
 
-          {!orderNumber && phase.kind === "loading" ? (
-            <p className="text-sm text-[color:var(--color-ink-muted)]">
-              This link looks incomplete. Open it again from the store you ordered from.
-            </p>
-          ) : null}
-
-          {phase.kind === "loading" ? (
-            <p className="text-sm text-[color:var(--color-ink-muted)]" role="status">
-              Loading your order…
-            </p>
-          ) : null}
-
-          {phase.kind === "paying" ? (
-            <p className="text-sm text-[color:var(--color-ink-muted)]" role="status">
-              Taking you to secure card payment…
-            </p>
-          ) : null}
-
-          {phase.kind === "error" ? (
-            <p className="text-sm text-[color:var(--color-danger)]" role="alert">
-              {phase.message}
-            </p>
-          ) : null}
-
-          {phase.kind === "paid" ? (
-            <div className="space-y-4">
-              <p className="text-sm text-[color:var(--color-ink-muted)]">
-                Your payment went through and your order is confirmed. A confirmation
-                email is on its way.
-              </p>
+    case "paid":
+      return (
+        <PayMessage
+          steps={3}
+          tone="success"
+          icon={<CheckIcon className="h-7 w-7" />}
+          title="Payment received"
+          actions={
+            <>
               {phase.orderStatusUrl ? (
-                <Button variant="cta" onClick={() => window.location.assign(phase.orderStatusUrl!)}>
+                <a href={phase.orderStatusUrl} className={getButtonClasses("primary", "w-full sm:w-auto")}>
                   View my order
-                </Button>
+                  <ArrowRightIcon className="h-4 w-4" />
+                </a>
               ) : null}
-            </div>
-          ) : null}
-
-          {phase.kind === "summary" && phase.order.state === "payable" ? (
-            <div className="space-y-4">
-              <ul className="divide-y divide-[color:var(--color-border)]">
-                {(phase.order.items ?? []).map((item, index) => (
-                  <li
-                    key={`${item.name}-${item.variant}-${index}`}
-                    className="flex items-center justify-between gap-4 py-3 text-sm"
-                  >
-                    <span className="text-[color:var(--color-ink)]">
-                      {item.name}
-                      {item.variant ? (
-                        <span className="text-[color:var(--color-ink-muted)]"> — {item.variant}</span>
-                      ) : null}
-                      <span className="text-[color:var(--color-ink-muted)]"> ×{item.quantity}</span>
-                    </span>
-                    <span className="font-semibold text-[color:var(--color-ink)]">
-                      {formatAmount(item.lineTotal, currency)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-              <div className="space-y-1 border-t border-[color:var(--color-border)] pt-4 text-sm">
-                <div className="flex justify-between text-[color:var(--color-ink-muted)]">
-                  <span>Subtotal</span>
-                  <span>{formatAmount(phase.order.subtotal ?? 0, currency)}</span>
-                </div>
-                {(phase.order.discountAmount ?? 0) > 0 ? (
-                  <div className="flex justify-between text-[color:var(--color-ink-muted)]">
-                    <span>
-                      Discount
-                      {phase.order.discountCode ? (
-                        <span className="font-mono"> ({phase.order.discountCode})</span>
-                      ) : null}
-                    </span>
-                    <span className="text-[color:var(--color-success)]">
-                      −{formatAmount(phase.order.discountAmount ?? 0, currency)}
-                    </span>
-                  </div>
-                ) : null}
-                {(phase.order.voucherTotal ?? 0) > 0 ? (
-                  <div className="flex justify-between text-[color:var(--color-ink-muted)]">
-                    <span>
-                      Store credit
-                      {phase.order.voucherCodes?.length ? (
-                        <span className="font-mono">
-                          {" "}
-                          ({phase.order.voucherCodes.map((voucher) => voucher.code).join(", ")})
-                        </span>
-                      ) : null}
-                    </span>
-                    <span className="text-[color:var(--color-success)]">
-                      −{formatAmount(phase.order.voucherTotal ?? 0, currency)}
-                    </span>
-                  </div>
-                ) : null}
-                <div className="flex justify-between text-[color:var(--color-ink-muted)]">
-                  <span>Shipping</span>
-                  <span>{formatAmount(phase.order.shippingCost ?? 0, currency)}</span>
-                </div>
-                {(phase.order.signatureFee ?? 0) > 0 ? (
-                  <div className="flex justify-between text-[color:var(--color-ink-muted)]">
-                    <span>Signature on delivery</span>
-                    <span>{formatAmount(phase.order.signatureFee ?? 0, currency)}</span>
-                  </div>
-                ) : null}
-                <div className="flex justify-between pt-2 text-base font-bold text-[color:var(--color-ink)]">
-                  <span>Total</span>
-                  <span>{formatAmount(phase.order.total ?? 0, currency)}</span>
-                </div>
-              </div>
-              <Button variant="cta" className="w-full" onClick={onPay}>
-                Pay by card
-              </Button>
-              <p className="text-xs text-[color:var(--color-ink-muted)]">
-                You&apos;ll be taken to our secure payment provider to enter your card
-                details. Your order is confirmed as soon as the payment goes through.
-              </p>
-            </div>
-          ) : null}
-
-          {phase.kind === "summary" && phase.order.state === "already_paid" ? (
-            <div className="space-y-4">
-              <p className="text-sm text-[color:var(--color-ink-muted)]">
-                This order is already paid — nothing left to do.
-              </p>
-              {phase.order.orderStatusUrl ? (
-                <Button
-                  variant="primary"
-                  onClick={() => window.location.assign(phase.order.orderStatusUrl!)}
-                >
-                  View my order
-                </Button>
-              ) : null}
-            </div>
-          ) : null}
-
-          {phase.kind === "summary" && phase.order.state === "cancelled" ? (
-            <p className="text-sm text-[color:var(--color-ink-muted)]">
-              This order was cancelled. If you believe that&apos;s a mistake, contact the
-              store you ordered from.
+              <p className="text-xs text-[color:var(--color-ink-subtle)]">You can close this page.</p>
+            </>
+          }
+        >
+          <p>
+            {phase.orderNumber ? (
+              <>
+                Order <OrderChip>{phase.orderNumber}</OrderChip> is confirmed.
+              </>
+            ) : (
+              "Your order is confirmed."
+            )}{" "}
+            A confirmation email is on its way.
+          </p>
+          {descriptor ? (
+            <p>
+              The charge shows on your card statement as{" "}
+              <span className="font-semibold text-[color:var(--color-ink)]">{descriptor}</span>.
             </p>
           ) : null}
+        </PayMessage>
+      );
 
-          {phase.kind === "summary" &&
-          (phase.order.state === "not_found" || phase.order.state === "not_card") ? (
-            <p className="text-sm text-[color:var(--color-ink-muted)]">
-              We couldn&apos;t find a card order with this number. Open your payment link
-              again from the store you ordered from.
-            </p>
-          ) : null}
-        </div>
-      </Container>
-    </section>
-  );
+    case "unpaid":
+      return (
+        <PayMessage
+          steps={1}
+          tone="warning"
+          icon={<CardIcon className="h-7 w-7" />}
+          title="Payment not completed"
+          actions={
+            orderNumber ? (
+              <a
+                href={`${CARD_CHECKOUT_PATH}?order=${encodeURIComponent(orderNumber)}`}
+                className={getButtonClasses("cta", "w-full sm:w-auto")}
+              >
+                Return to payment
+              </a>
+            ) : null
+          }
+        >
+          <p>No payment was taken and your order is still waiting. You can try again whenever you&apos;re ready.</p>
+        </PayMessage>
+      );
+
+    case "verify-error":
+      return (
+        <PayMessage
+          tone="warning"
+          icon={<AlertIcon className="h-7 w-7" />}
+          title="Still confirming your payment"
+          actions={
+            <Button variant="primary" onClick={retry}>
+              Check again
+            </Button>
+          }
+        >
+          <p>We couldn&apos;t confirm your payment just now.</p>
+          <p>
+            If it went through, it&apos;s safe: your order is confirmed automatically and a
+            confirmation email follows, even if this page can&apos;t show it yet.
+          </p>
+        </PayMessage>
+      );
+
+    case "load-error":
+      return (
+        <PayMessage
+          tone="danger"
+          icon={<AlertIcon className="h-7 w-7" />}
+          title="We couldn't load your order"
+          actions={
+            <Button variant="primary" onClick={retry}>
+              Try again
+            </Button>
+          }
+        >
+          <p>{phase.message}</p>
+          <p>Nothing has been charged.</p>
+        </PayMessage>
+      );
+
+    case "closed":
+      if (phase.state === "already_paid") {
+        return (
+          <PayMessage
+            steps={3}
+            tone="success"
+            icon={<CheckIcon className="h-7 w-7" />}
+            title="This order is already paid"
+          >
+            <p>Nothing more to do here. Your order confirmation email has the details.</p>
+          </PayMessage>
+        );
+      }
+      if (phase.state === "cancelled") {
+        return (
+          <PayMessage
+            tone="neutral"
+            icon={<CircleSlashIcon className="h-7 w-7" />}
+            title="This order was cancelled"
+          >
+            <p>It can&apos;t be paid any more. If you still want these items, please place a new order.</p>
+          </PayMessage>
+        );
+      }
+      return (
+        <PayMessage
+          tone="neutral"
+          icon={<AlertIcon className="h-7 w-7" />}
+          title="We couldn't find this payment"
+        >
+          <p>{freshLinkHint}</p>
+        </PayMessage>
+      );
+
+    case "missing":
+      return (
+        <PayMessage
+          tone="neutral"
+          icon={<AlertIcon className="h-7 w-7" />}
+          title="This payment link is incomplete"
+        >
+          <p>{freshLinkHint}</p>
+        </PayMessage>
+      );
+  }
 };

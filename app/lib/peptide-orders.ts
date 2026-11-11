@@ -1,5 +1,7 @@
 import "server-only";
 
+import { parseOrderCurrency, type CardOrderSummary } from "@/app/lib/card-checkout";
+
 /**
  * Client for the peptide store's card-checkout handoff API
  * (/api/orders/card-checkout on the preptide app). Card orders placed on the
@@ -83,6 +85,45 @@ export const fetchPeptideCardOrder = async (
     `/api/orders/card-checkout?order=${encodeURIComponent(orderNumber)}`
   );
   return payload as unknown as PeptideCardOrder;
+};
+
+const toAmount = (value: unknown) => {
+  const amount = Number(value ?? 0);
+  return Number.isFinite(amount) ? amount : 0;
+};
+
+/**
+ * Narrows the peptide store's response to what the public pay page may show.
+ * The buyer's email and the signed order-status link stay on the server:
+ * order numbers are guessable, so the summary must not unlock anything.
+ * Returns null for a payable order without a usable total or currency.
+ */
+export const toCardOrderSummary = (order: PeptideCardOrder): CardOrderSummary | null => {
+  if (order.state !== "payable") {
+    return { state: order.state, orderNumber: order.orderNumber };
+  }
+  const total = toAmount(order.total);
+  const currency = parseOrderCurrency(order.currency);
+  if (total <= 0 || !currency) return null;
+  return {
+    state: "payable",
+    orderNumber: order.orderNumber,
+    items: (order.items ?? []).map((item) => ({
+      name: String(item.name ?? ""),
+      variant: String(item.variant ?? ""),
+      quantity: toAmount(item.quantity),
+      lineTotal: toAmount(item.lineTotal),
+    })),
+    subtotal: toAmount(order.subtotal),
+    discountAmount: toAmount(order.discountAmount),
+    discountCode: order.discountCode ?? null,
+    voucherCodes: (order.voucherCodes ?? []).map((voucher) => voucher.code),
+    voucherTotal: toAmount(order.voucherTotal),
+    shippingCost: toAmount(order.shippingCost),
+    signatureFee: toAmount(order.signatureFee),
+    total,
+    currency,
+  };
 };
 
 /** Reports a successful card payment. Idempotent on the peptide store's side. */
