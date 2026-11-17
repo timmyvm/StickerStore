@@ -2,15 +2,15 @@
 
 # Peel Supply — CLAUDE.md
 
-Limited-run die-cut sticker store. Same design system and layout as the Au
-Peptide Labs storefront (timmyvm/preptide), rebuilt as its own app.
+Storefront that mirrors the Au Peptide Labs catalogue (timmyvm/preptide). Same
+design system and layout as APL, rebuilt as its own app.
 
 ## Stack
 - Next.js 16 App Router (canary), React 19, TypeScript strict, Tailwind CSS 4
-- Supabase: the SAME project as APL, but only the `sticker_*` tables
-  (supabase/migrations/). Never read or write APL's products, variants,
-  orders, customers or subscribers from this app: those feed APL's admin,
-  revenue, bank-sync auto-confirm, email flows and Ads uploads.
+- Supabase: the SAME project as APL. This app's own tables are `sticker_*`
+  (supabase/migrations/). It mirrors APL's `variants` (stock and AUD price)
+  into `sticker_variants` through `peptide_variant_id`, and its orders
+  decrement APL's `variants.stock` directly.
 - Resend over fetch for order emails (optional; skipped while unset)
 - Vercel (syd1), hourly cron cancels unpaid orders
 
@@ -24,10 +24,12 @@ Peptide Labs storefront (timmyvm/preptide), rebuilt as its own app.
 - Commit with an explicit pathspec, never a bare `git commit` after `git add`.
 
 ## Money and stock
-- Prices and stock live in `sticker_variants`. The client never sends a price:
-  `/api/orders` passes variant ids and quantities to `place_sticker_order()`,
-  which prices from the table, locks and decrements stock, and inserts the
-  order in one transaction.
+- APL's `variants` table is the source of truth for stock and price. A pg_cron
+  job copies them into `sticker_variants` (`stock`, `price_aud`) every minute.
+  The client never sends a price: `/api/orders` passes variant ids and
+  quantities to `place_sticker_order()`, which prices from `sticker_variants`,
+  locks the APL variant row, decrements its stock, and inserts the order in one
+  transaction.
 - Shipping fee and free threshold are `SHIPPING_FACTS` in app/lib/shipping.ts.
   The server passes the same numbers to the RPC, so cart, checkout and the
   stored order agree. Change them there only. Free shipping applies AT the
