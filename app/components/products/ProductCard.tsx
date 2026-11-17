@@ -140,7 +140,9 @@ export const ProductCard = ({ product }: ProductCardProps) => {
                 SOLD OUT
               </span>
             ) : null}
-            <span className="absolute right-3 top-3 rounded-full border border-[color:var(--color-border)] bg-[color:var(--color-surface-elevated)]/90 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[color:var(--color-ink-muted)] backdrop-blur">
+            {/* On a phone-width card the two pills don't fit side by side, so a
+                sold-out card shows only SOLD OUT there. */}
+            <span className={`${isSoldOut ? "hidden sm:block" : ""} absolute right-3 top-3 rounded-full border border-[color:var(--color-border)] bg-[color:var(--color-surface-elevated)]/90 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[color:var(--color-ink-muted)] backdrop-blur`}>
               {product.finish}
             </span>
           </Link>
